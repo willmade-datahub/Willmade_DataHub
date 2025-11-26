@@ -1,0 +1,434 @@
+import json
+import os
+import re
+import tempfile
+from typing import Any, Dict, List
+
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="Willmade DataHub", layout="wide")
+st.markdown(
+    "<h1 style='text-align:center; color:#ff66cc;'>✨ Willmade DataHub ✨</h1>",
+    unsafe_allow_html=True,
+)
+
+# ------------------------------------------------------------------
+# Backend toggle
+# ------------------------------------------------------------------
+DATA_BACKEND = os.getenv("DATA_BACKEND", "").lower()
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "willmade-datahub")
+
+STORE_CAFE = "blog_store.txt"  # ID,PHONE
+STORE_BEST = "best_store.txt"  # BEST ID ONLY
+MATCH_XLSX = "match_result.xlsx"
+
+COL_CAFE = "cafe_store"
+COL_BEST = "best_store"
+COL_MATCH = "match_results"
+
+_firestore_client = None
+
+
+def _use_firestore() -> bool:
+    return DATA_BACKEND == "firestore"
+
+
+def _get_service_account_path() -> str | None:
+    """
+    Streamlit Cloud에서 st.secrets["firebase_key"]에 서비스계정 JSON을 넣어두면
+    임시 파일로 저장해 경로를 반환. 로컬/Cloud Run 등에서는
+    GOOGLE_APPLICATION_CREDENTIALS 환경변수 또는 ADC를 사용.
+    """
+    if "firebase_key" in st.secrets:
+        data = st.secrets["firebase_key"]
+        if isinstance(data, str):
+            data = json.loads(data)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        tmp.write(json.dumps(data).encode("utf-8"))
+        tmp.flush()
+        return tmp.name
+    return os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+
+def _get_firestore():
+    """Lazy init Firestore client."""
+    global _firestore_client
+    if _firestore_client is not None:
+        return _firestore_client
+
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+    except ImportError as exc:
+        raise RuntimeError(
+            "firebase_admin is not installed. Run `pip install -r requirements.txt`."
+        ) from exc
+
+    cred_path = _get_service_account_path()
+    cred = (
+        credentials.Certificate(cred_path)
+        if cred_path and os.path.exists(cred_path)
+        else credentials.ApplicationDefault()
+    )
+
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(cred, {"projectId": FIREBASE_PROJECT_ID})
+
+    _firestore_client = firestore.client()
+    return _firestore_client
+
+
+# ------------------------------------------------------------------
+# Phone extraction helpers
+# ------------------------------------------------------------------
+CHAR_MAP = {
+    "o": "0",
+    "O": "0",
+    "q": "0",
+    "Q": "0",
+    "l": "1",
+    "I": "1",
+    "i": "1",
+    "L": "1",
+    "Z": "2",
+    "z": "2",
+    "S": "5",
+    "s": "5",
+    "B": "8",
+    "b": "8",
+    "G": "6",
+    "g": "6",
+    "T": "7",
+    "t": "7",
+    "A": "4",
+    "a": "4",
+    "공": "0",
+    "영": "0",
+    "일": "1",
+    "둘": "2",
+    "셋": "3",
+    "넷": "4",
+    "다섯": "5",
+    "여섯": "6",
+    "칠": "7",
+    "팔": "8",
+    "아홉": "9",
+}
+
+PHONE_PATTERN = re.compile(r"010[0-9]{8}")
+
+
+def _normalize(text: Any) -> str:
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    return "".join(CHAR_MAP.get(ch, ch) for ch in text)
+
+
+def extract_phone_numbers(text: Any) -> List[str]:
+    norm = _normalize(text)
+    digits = re.sub(r"[^0-9]", "", norm)
+    found = PHONE_PATTERN.findall(digits)
+    return list({f"{f[:3]}-{f[3:7]}-{f[7:]}" for f in found})
+
+
+# ------------------------------------------------------------------
+# Storage helpers (Firestore / local fallback)
+# ------------------------------------------------------------------
+def _to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    return df.to_dict(orient="records")
+
+
+def save_cafe(df: pd.DataFrame) -> None:
+    if _use_firestore():
+        client = _get_firestore()
+        from firebase_admin import firestore
+
+        batch = client.batch()
+        col = client.collection(COL_CAFE)
+        for row in _to_records(df):
+            doc_id = f"{row['블로그ID']}_{row['전화번호']}"
+            payload = {
+                "blog_id": row["블로그ID"],
+                "phone": row["전화번호"],
+                "created_at": firestore.SERVER_TIMESTAMP,
+            }
+            batch.set(col.document(doc_id), payload)
+        batch.commit()
+        return
+
+    new_lines = [f"{row['블로그ID']},{row['전화번호']}\n" for _, row in df.iterrows()]
+    existing = set()
+    if os.path.exists(STORE_CAFE):
+        with open(STORE_CAFE, "r", encoding="utf-8") as f:
+            existing = set(f.readlines())
+    merged = existing.union(new_lines)
+    with open(STORE_CAFE, "w", encoding="utf-8") as f:
+        f.writelines(sorted(list(merged)))
+
+
+def load_cafe() -> pd.DataFrame:
+    if _use_firestore():
+        client = _get_firestore()
+        docs = client.collection(COL_CAFE).stream()
+        rows = [{"블로그ID": d.to_dict().get("blog_id"), "전화번호": d.to_dict().get("phone")} for d in docs]
+        if not rows:
+            return pd.DataFrame(columns=["블로그ID", "전화번호"])
+        return pd.DataFrame(rows).drop_duplicates()
+
+    if not os.path.exists(STORE_CAFE):
+        return pd.DataFrame(columns=["블로그ID", "전화번호"])
+    with open(STORE_CAFE, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    return pd.DataFrame([l.strip().split(",") for l in lines], columns=["블로그ID", "전화번호"])
+
+
+def save_best(ids: List[str]) -> None:
+    if _use_firestore():
+        client = _get_firestore()
+        from firebase_admin import firestore
+
+        batch = client.batch()
+        col = client.collection(COL_BEST)
+        for bid in ids:
+            payload = {"blog_id": bid, "created_at": firestore.SERVER_TIMESTAMP}
+            batch.set(col.document(bid), payload)
+        batch.commit()
+        return
+
+    new_lines = [f"{bid}\n" for bid in ids]
+    existing = set()
+    if os.path.exists(STORE_BEST):
+        with open(STORE_BEST, "r", encoding="utf-8") as f:
+            existing = set(f.readlines())
+    merged = existing.union(new_lines)
+    with open(STORE_BEST, "w", encoding="utf-8") as f:
+        f.writelines(sorted(list(merged)))
+
+
+def load_best() -> pd.DataFrame:
+    if _use_firestore():
+        client = _get_firestore()
+        docs = client.collection(COL_BEST).stream()
+        ids = [d.to_dict().get("blog_id") for d in docs if d.to_dict().get("blog_id")]
+        if not ids:
+            return pd.DataFrame(columns=["블로그ID"])
+        return pd.DataFrame(ids, columns=["블로그ID"]).drop_duplicates()
+
+    if not os.path.exists(STORE_BEST):
+        return pd.DataFrame(columns=["블로그ID"])
+    with open(STORE_BEST, "r", encoding="utf-8") as f:
+        ids = [i.strip() for i in f.readlines() if i.strip()]
+    return pd.DataFrame(ids, columns=["블로그ID"])
+
+
+def save_match(df: pd.DataFrame) -> None:
+    if _use_firestore():
+        client = _get_firestore()
+        from firebase_admin import firestore
+
+        batch = client.batch()
+        col = client.collection(COL_MATCH)
+        for row in _to_records(df):
+            bid = row["블로그ID"]
+            doc = col.document(bid)
+            payload = {
+                "blog_id": bid,
+                "phone": row.get("전화번호", ""),
+                "memo": row.get("메모", ""),
+                "created_at": firestore.SERVER_TIMESTAMP,
+            }
+            batch.set(doc, payload)
+        batch.commit()
+        return
+
+    df.to_excel(MATCH_XLSX, index=False)
+
+
+def load_match() -> pd.DataFrame:
+    if _use_firestore():
+        client = _get_firestore()
+        docs = client.collection(COL_MATCH).stream()
+        rows = []
+        for d in docs:
+            data = d.to_dict()
+            rows.append(
+                {
+                    "블로그ID": data.get("blog_id", ""),
+                    "전화번호": data.get("phone", ""),
+                    "메모": data.get("memo", ""),
+                }
+            )
+        if not rows:
+            return pd.DataFrame(columns=["블로그ID", "전화번호", "메모"])
+        df = pd.DataFrame(rows)
+        if "메모" not in df.columns:
+            df["메모"] = ""
+        return df
+
+    if not os.path.exists(MATCH_XLSX):
+        return pd.DataFrame(columns=["블로그ID", "전화번호", "메모"])
+    df = pd.read_excel(MATCH_XLSX, dtype=str)
+    if "메모" not in df.columns:
+        df["메모"] = ""
+    return df
+
+
+def clear_all():
+    if _use_firestore():
+        client = _get_firestore()
+        for col_name in [COL_CAFE, COL_BEST, COL_MATCH]:
+            docs = list(client.collection(col_name).stream())
+            for d in docs:
+                d.reference.delete()
+        return
+
+    for f in [STORE_CAFE, STORE_BEST, MATCH_XLSX]:
+        if os.path.exists(f):
+            os.remove(f)
+
+
+# ------------------------------------------------------------------
+# Session init
+# ------------------------------------------------------------------
+if "excel_df" not in st.session_state:
+    st.session_state["excel_df"] = None
+if "best_df" not in st.session_state:
+    st.session_state["best_df"] = None
+
+
+# ------------------------------------------------------------------
+# UI
+# ------------------------------------------------------------------
+menu = st.sidebar.radio(
+    "메뉴 선택",
+    ["파일 업로드", "최적리스트 비교", "누적 저장소", "매칭 결과 & 메모", "데이터 초기화"],
+)
+
+if _use_firestore():
+    st.sidebar.success(f"저장소: Firestore ({FIREBASE_PROJECT_ID})")
+else:
+    st.sidebar.info("저장소: 로컬 파일")
+
+
+# ============================================================
+# 파일 업로드
+# ============================================================
+if menu == "파일 업로드":
+    st.header("📁 파일 업로드")
+    uploaded = st.file_uploader("엑셀 파일 업로드", type=["xlsx", "xls"], key="excel_upload")
+
+    if uploaded:
+        df = pd.read_excel(uploaded, header=None)
+        st.session_state["excel_df"] = df
+        st.success("엑셀을 불러왔습니다 (세션 저장됨)")
+        st.write(df.head())
+
+    if st.session_state["excel_df"] is not None and st.button("전화번호 추출 & 누적 저장"):
+        extracted: List[List[str]] = []
+        df = st.session_state["excel_df"]
+
+        for i in range(1, len(df)):
+            blog_id = str(df.iloc[i, 0]).strip()
+            text = f"{df.iloc[i, 1]} {df.iloc[i, 3]}" if df.shape[1] > 3 else str(df.iloc[i, 1])
+            phones = extract_phone_numbers(text)
+            for p in phones:
+                extracted.append([blog_id, p])
+
+        result = pd.DataFrame(extracted, columns=["블로그ID", "전화번호"]).drop_duplicates()
+        save_cafe(result)
+        st.success("카페 DB에 저장 완료")
+        st.metric("추출 개수", len(result))
+        st.dataframe(result, use_container_width=True)
+
+
+# ============================================================
+# 최적리스트 TXT 업로드 + 매칭
+# ============================================================
+elif menu == "최적리스트 비교":
+    st.header("📌 최적리스트 TXT 업로드")
+    txt_file = st.file_uploader("TXT 파일 업로드", type=["txt"], key="best_upload")
+
+    if txt_file:
+        text = txt_file.read().decode("utf-8")
+        ids = [i.strip() for i in text.splitlines() if i.strip()]
+        st.session_state["best_df"] = pd.DataFrame(ids, columns=["블로그ID"])
+        save_best(ids)
+        st.success("최적리스트 DB 저장 완료")
+        st.metric("TXT 업로드 개수", len(ids))
+
+    if st.session_state["best_df"] is not None:
+        st.dataframe(st.session_state["best_df"].head(50), use_container_width=True)
+
+        cafe_df = load_cafe()
+        if not cafe_df.empty:
+            matched = cafe_df[cafe_df["블로그ID"].isin(st.session_state["best_df"]["블로그ID"])]
+            matched = matched.drop_duplicates(subset=["블로그ID"])
+            matched["메모"] = ""
+            save_match(matched)
+            st.metric("매칭된 개수", len(matched))
+            st.dataframe(matched, use_container_width=True)
+
+
+# ============================================================
+# 누적 저장소
+# ============================================================
+elif menu == "누적 저장소":
+    st.header("📦 누적 저장소 (2분할)")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("📦 카페 누적 DB")
+        df_cafe = load_cafe()
+        st.metric("누적 수량", len(df_cafe))
+        st.dataframe(df_cafe.head(30), use_container_width=True)
+        st.download_button(
+            "전체 TXT 다운로드",
+            "\n".join([f"{r['블로그ID']},{r['전화번호']}" for _, r in df_cafe.iterrows()]).encode("utf-8"),
+            "blog_store.txt",
+        )
+
+    with col2:
+        st.subheader("📚 최적리스트 DB")
+        df_best = load_best()
+        st.metric("최적리스트 수", len(df_best))
+        st.dataframe(df_best.head(30), use_container_width=True)
+        st.download_button(
+            "전체 TXT 다운로드",
+            "\n".join(df_best["블로그ID"].tolist()).encode("utf-8"),
+            "best_store.txt",
+        )
+
+
+# ============================================================
+# 매칭 결과 & 메모
+# ============================================================
+elif menu == "매칭 결과 & 메모":
+    st.header("📞 매칭 결과 & 메모")
+
+    df = load_match()
+    if df.empty:
+        st.warning("매칭 데이터가 없습니다.")
+    else:
+        st.metric("매칭결과 수", len(df))
+        if "메모" not in df.columns:
+            df["메모"] = ""
+        edited = st.data_editor(df, use_container_width=True)
+
+        if st.button("저장"):
+            save_match(edited)
+            st.success("저장 완료")
+
+
+# ============================================================
+# 초기화
+# ============================================================
+elif menu == "데이터 초기화":
+    st.header("🧹 데이터 초기화")
+    if st.button("모두 삭제"):
+        clear_all()
+        st.session_state.clear()
+        st.success("모두 초기화했습니다.")

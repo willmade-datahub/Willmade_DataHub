@@ -1,0 +1,6 @@
+cd C:\Willmade_DataHub
+pip install openpyxl
+streamlit run streamlit_app.py
+
+cd C:\ngrok
+ngrok.exe http 8501
