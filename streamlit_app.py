@@ -207,12 +207,29 @@ def save_cafe(df: pd.DataFrame) -> None:
         f.writelines(sorted(list(merged)))
 
 
+def _fs_query(collection: str, limit: int) -> List[Dict[str, Any]]:
+    """Ordered, limited fetch to avoid unbounded stream latency."""
+    client = _get_firestore()
+    try:
+        docs = (
+            client.collection(collection)
+            .order_by("created_at", direction=client._firestore.Query.DESCENDING)  # type: ignore[attr-defined]
+            .limit(limit)
+            .stream()
+        )
+    except Exception:
+        # created_at 없을 때 fallback (index 없으면 느릴 수 있음)
+        docs = client.collection(collection).limit(limit).stream()
+
+    rows = [d.to_dict() for d in docs]
+    return rows
+
+
 def load_cafe(limit: int | None = None) -> pd.DataFrame:
     limit = limit or MAX_FETCH
     if _use_firestore():
-        client = _get_firestore()
-        docs = client.collection(COL_CAFE).limit(limit).stream()
-        rows = [{"블로그ID": d.to_dict().get("blog_id"), "전화번호": d.to_dict().get("phone")} for d in docs]
+        rows = _fs_query(COL_CAFE, limit)
+        rows = [{"블로그ID": r.get("blog_id"), "전화번호": r.get("phone")} for r in rows if r]
         if not rows:
             return pd.DataFrame(columns=["블로그ID", "전화번호"])
         return pd.DataFrame(rows).drop_duplicates()
@@ -256,9 +273,8 @@ def save_best(ids: List[str]) -> None:
 def load_best(limit: int | None = None) -> pd.DataFrame:
     limit = limit or MAX_FETCH
     if _use_firestore():
-        client = _get_firestore()
-        docs = client.collection(COL_BEST).limit(limit).stream()
-        ids = [d.to_dict().get("blog_id") for d in docs if d.to_dict().get("blog_id")]
+        rows = _fs_query(COL_BEST, limit)
+        ids = [r.get("blog_id") for r in rows if r.get("blog_id")]
         if not ids:
             return pd.DataFrame(columns=["블로그ID"])
         return pd.DataFrame(ids, columns=["블로그ID"]).drop_duplicates()
@@ -301,18 +317,15 @@ def save_match(df: pd.DataFrame) -> None:
 def load_match(limit: int | None = None) -> pd.DataFrame:
     limit = limit or MAX_FETCH
     if _use_firestore():
-        client = _get_firestore()
-        docs = client.collection(COL_MATCH).limit(limit).stream()
-        rows = []
-        for d in docs:
-            data = d.to_dict()
-            rows.append(
-                {
-                    "블로그ID": data.get("blog_id", ""),
-                    "전화번호": data.get("phone", ""),
-                    "메모": data.get("memo", ""),
-                }
-            )
+        rows_raw = _fs_query(COL_MATCH, limit)
+        rows = [
+            {
+                "블로그ID": r.get("blog_id", ""),
+                "전화번호": r.get("phone", ""),
+                "메모": r.get("memo", ""),
+            }
+            for r in rows_raw
+        ]
         if not rows:
             return pd.DataFrame(columns=["블로그ID", "전화번호", "메모"])
         df = pd.DataFrame(rows)
