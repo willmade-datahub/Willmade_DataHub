@@ -357,6 +357,41 @@ def load_match(limit: int | None = None) -> pd.DataFrame:
     return df
 
 
+def count_cafe() -> int | None:
+    if _use_firestore():
+        cnt = _fs_count(COL_CAFE)
+        if cnt is not None:
+            return int(cnt)
+    if os.path.exists(STORE_CAFE):
+        with open(STORE_CAFE, "r", encoding="utf-8") as f:
+            return sum(1 for _ in f)
+    return None
+
+
+def count_best() -> int | None:
+    if _use_firestore():
+        cnt = _fs_count(COL_BEST)
+        if cnt is not None:
+            return int(cnt)
+    if os.path.exists(STORE_BEST):
+        with open(STORE_BEST, "r", encoding="utf-8") as f:
+            return sum(1 for _ in f)
+    return None
+
+
+def count_match() -> int | None:
+    if _use_firestore():
+        cnt = _fs_count(COL_MATCH)
+        if cnt is not None:
+            return int(cnt)
+    if os.path.exists(MATCH_XLSX):
+        try:
+            return len(load_excel(MATCH_XLSX))
+        except Exception:
+            return None
+    return None
+
+
 def clear_all():
     if _use_firestore():
         client = _get_firestore()
@@ -463,6 +498,9 @@ elif menu == "누적 저장소":
 
     with col1:
         st.subheader("📦 카페 누적 DB")
+        cafe_total = count_cafe()
+        if cafe_total is not None:
+            st.metric("총 건수", cafe_total)
         if st.button("카페 데이터 불러오기", key="load_cafe_view"):
             with st.spinner("불러오는 중..."):
                 df_cafe = load_cafe(limit=DEFAULT_VIEW_LIMIT)
@@ -474,6 +512,9 @@ elif menu == "누적 저장소":
 
     with col2:
         st.subheader("📚 최적리스트 DB")
+        best_total = count_best()
+        if best_total is not None:
+            st.metric("총 건수", best_total)
         if st.button("최적리스트 불러오기", key="load_best_view"):
             with st.spinner("불러오는 중..."):
                 df_best = load_best(limit=DEFAULT_VIEW_LIMIT)
@@ -489,6 +530,10 @@ elif menu == "누적 저장소":
 # ============================================================
 elif menu == "매칭 결과 & 메모":
     st.header("📞 매칭 결과 & 메모")
+
+    match_total = count_match()
+    if match_total is not None:
+        st.metric("총 건수", match_total)
 
     if st.button("매칭 데이터 불러오기", key="load_match_view"):
         with st.spinner("불러오는 중..."):
