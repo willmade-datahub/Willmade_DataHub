@@ -32,6 +32,7 @@ def _get_config(key: str, default: str = "") -> str:
 DATA_BACKEND = _get_config("DATA_BACKEND", "").lower()
 FIREBASE_PROJECT_ID = _get_config("FIREBASE_PROJECT_ID", "willmade-datahub")
 MAX_FETCH = int(_get_config("MAX_FETCH", "3000"))
+SAMPLE_ROWS = int(_get_config("SAMPLE_ROWS", "10"))
 DEFAULT_VIEW_LIMIT = MAX_FETCH  # 화면 표시 시 기본 행 수 제한
 
 STORE_CAFE = "blog_store.txt"  # ID,PHONE
@@ -207,26 +208,41 @@ def save_cafe(df: pd.DataFrame) -> None:
         f.writelines(sorted(list(merged)))
 
 
-def _fs_query(collection: str, limit: int) -> List[Dict[str, Any]]:
+def _fs_query(collection: str, limit: int | None = None) -> List[Dict[str, Any]]:
     """Ordered, limited fetch to avoid unbounded stream latency."""
     client = _get_firestore()
+    query = client.collection(collection)
     try:
-        docs = (
-            client.collection(collection)
-            .order_by("created_at", direction=client._firestore.Query.DESCENDING)  # type: ignore[attr-defined]
-            .limit(limit)
-            .stream()
+        query = query.order_by(
+            "created_at", direction=client._firestore.Query.DESCENDING  # type: ignore[attr-defined]
         )
     except Exception:
-        # created_at 없을 때 fallback (index 없으면 느릴 수 있음)
-        docs = client.collection(collection).limit(limit).stream()
+        pass
+
+    if limit:
+        query = query.limit(limit)
+
+    docs = query.stream()
 
     rows = [d.to_dict() for d in docs]
     return rows
 
 
+def _fs_count(collection: str) -> int | None:
+    """Use Firestore aggregation count when available; None if fails."""
+    try:
+        client = _get_firestore()
+        agg = client.collection(collection).count().get()
+        if agg and len(agg) > 0:
+            # type: ignore[index]
+            return agg[0].get("count", None)
+    except Exception:
+        return None
+    return None
+
+
 def load_cafe(limit: int | None = None) -> pd.DataFrame:
-    limit = limit or MAX_FETCH
+    limit = limit or SAMPLE_ROWS
     if _use_firestore():
         rows = _fs_query(COL_CAFE, limit)
         rows = [{"블로그ID": r.get("blog_id"), "전화번호": r.get("phone")} for r in rows if r]
@@ -271,7 +287,7 @@ def save_best(ids: List[str]) -> None:
 
 
 def load_best(limit: int | None = None) -> pd.DataFrame:
-    limit = limit or MAX_FETCH
+    limit = limit or SAMPLE_ROWS
     if _use_firestore():
         rows = _fs_query(COL_BEST, limit)
         ids = [r.get("blog_id") for r in rows if r.get("blog_id")]
@@ -315,7 +331,6 @@ def save_match(df: pd.DataFrame) -> None:
 
 
 def load_match(limit: int | None = None) -> pd.DataFrame:
-    limit = limit or MAX_FETCH
     if _use_firestore():
         rows_raw = _fs_query(COL_MATCH, limit)
         rows = [
@@ -346,7 +361,7 @@ def clear_all():
     if _use_firestore():
         client = _get_firestore()
         for col_name in [COL_CAFE, COL_BEST, COL_MATCH]:
-            docs = list(client.collection(col_name).stream())
+            docs = client.collection(col_name).stream()
             for d in docs:
                 d.reference.delete()
         return
