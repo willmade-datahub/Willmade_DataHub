@@ -14,8 +14,18 @@ except ImportError:
 # Switch to Firestore by setting DATA_BACKEND=firestore and providing
 # GOOGLE_APPLICATION_CREDENTIALS that points to your Firebase service account JSON.
 DB_PATH = r"C:\Willmade_DataHub\data.db"
-DATA_BACKEND = os.getenv("DATA_BACKEND", "").lower()
-FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "willmade-datahub")
+
+
+def _get_config(key: str, default: str = "") -> str:
+    if os.getenv(key):
+        return os.getenv(key)
+    if st and hasattr(st, "secrets") and key in st.secrets:
+        return str(st.secrets[key])
+    return default
+
+
+DATA_BACKEND = _get_config("DATA_BACKEND", "").lower()
+FIREBASE_PROJECT_ID = _get_config("FIREBASE_PROJECT_ID", "willmade-datahub")
 
 _firestore_client = None
 
@@ -24,12 +34,31 @@ def _use_firestore() -> bool:
     return DATA_BACKEND == "firestore"
 
 
+def _parse_service_account(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        raise ValueError("firebase_key must be JSON string or dict")
+
+    candidates = [
+        raw,
+        raw.replace("\r\n", "\n"),
+        raw.replace("\r\n", "\n").replace("\n", "\\n"),
+    ]
+    for cand in candidates:
+        try:
+            return json.loads(cand, strict=False)
+        except json.JSONDecodeError:
+            continue
+
+    cleaned = re.sub(r"[\x00-\x1f]", lambda m: f"\\u{ord(m.group()):04x}", raw)
+    return json.loads(cleaned, strict=False)
+
+
 def _get_service_account_path() -> str | None:
     # If running on Streamlit Cloud, allow secrets["firebase_key"]
     if st and hasattr(st, "secrets") and "firebase_key" in st.secrets:
-        data = st.secrets["firebase_key"]
-        if isinstance(data, str):
-            data = json.loads(data)
+        data = _parse_service_account(st.secrets["firebase_key"])
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
         tmp.write(json.dumps(data).encode("utf-8"))
         tmp.flush()

@@ -7,6 +7,11 @@ from typing import Any, Dict, List
 import pandas as pd
 import streamlit as st
 
+@st.cache_data
+def load_excel(path):
+    import pandas as pd
+    return pd.read_excel(path)
+
 st.set_page_config(page_title="Willmade DataHub", layout="wide")
 st.markdown(
     "<h1 style='text-align:center; color:#ff66cc;'>✨ Willmade DataHub ✨</h1>",
@@ -14,10 +19,20 @@ st.markdown(
 )
 
 # ------------------------------------------------------------------
-# Backend toggle
+# Backend toggle (env 우선, 없으면 secrets 사용)
 # ------------------------------------------------------------------
-DATA_BACKEND = os.getenv("DATA_BACKEND", "").lower()
-FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "willmade-datahub")
+def _get_config(key: str, default: str = "") -> str:
+    if os.getenv(key):
+        return os.getenv(key)
+    if key in st.secrets:
+        return str(st.secrets[key])
+    return default
+
+
+DATA_BACKEND = _get_config("DATA_BACKEND", "").lower()
+FIREBASE_PROJECT_ID = _get_config("FIREBASE_PROJECT_ID", "willmade-datahub")
+MAX_FETCH = int(_get_config("MAX_FETCH", "3000"))
+DEFAULT_VIEW_LIMIT = MAX_FETCH  # 화면 표시 시 기본 행 수 제한
 
 STORE_CAFE = "blog_store.txt"  # ID,PHONE
 STORE_BEST = "best_store.txt"  # BEST ID ONLY
@@ -34,6 +49,31 @@ def _use_firestore() -> bool:
     return DATA_BACKEND == "firestore"
 
 
+def _parse_service_account(raw: Any) -> Dict[str, Any]:
+    """Accepts dict or string (even poorly escaped) and returns a dict."""
+    if isinstance(raw, dict):
+        return raw
+
+    if not isinstance(raw, str):
+        raise ValueError("firebase_key must be JSON string or dict")
+
+    # Try a few safe normalizations
+    candidates = [
+        raw,
+        raw.replace("\r\n", "\n"),
+        raw.replace("\r\n", "\n").replace("\n", "\\n"),
+    ]
+    for cand in candidates:
+        try:
+            return json.loads(cand, strict=False)
+        except json.JSONDecodeError:
+            continue
+
+    # Last resort: escape control chars
+    cleaned = re.sub(r"[\x00-\x1f]", lambda m: f"\\u{ord(m.group()):04x}", raw)
+    return json.loads(cleaned, strict=False)
+
+
 def _get_service_account_path() -> str | None:
     """
     Streamlit Cloud에서 st.secrets["firebase_key"]에 서비스계정 JSON을 넣어두면
@@ -41,9 +81,7 @@ def _get_service_account_path() -> str | None:
     GOOGLE_APPLICATION_CREDENTIALS 환경변수 또는 ADC를 사용.
     """
     if "firebase_key" in st.secrets:
-        data = st.secrets["firebase_key"]
-        if isinstance(data, str):
-            data = json.loads(data)
+        data = _parse_service_account(st.secrets["firebase_key"])
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
         tmp.write(json.dumps(data).encode("utf-8"))
         tmp.flush()
@@ -169,10 +207,11 @@ def save_cafe(df: pd.DataFrame) -> None:
         f.writelines(sorted(list(merged)))
 
 
-def load_cafe() -> pd.DataFrame:
+def load_cafe(limit: int | None = None) -> pd.DataFrame:
+    limit = limit or MAX_FETCH
     if _use_firestore():
         client = _get_firestore()
-        docs = client.collection(COL_CAFE).stream()
+        docs = client.collection(COL_CAFE).limit(limit).stream()
         rows = [{"블로그ID": d.to_dict().get("blog_id"), "전화번호": d.to_dict().get("phone")} for d in docs]
         if not rows:
             return pd.DataFrame(columns=["블로그ID", "전화번호"])
@@ -180,9 +219,15 @@ def load_cafe() -> pd.DataFrame:
 
     if not os.path.exists(STORE_CAFE):
         return pd.DataFrame(columns=["블로그ID", "전화번호"])
+    rows: List[List[str]] = []
     with open(STORE_CAFE, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    return pd.DataFrame([l.strip().split(",") for l in lines], columns=["블로그ID", "전화번호"])
+        for idx, line in enumerate(f):
+            if idx >= limit:
+                break
+            parts = line.strip().split(",")
+            if len(parts) == 2:
+                rows.append(parts)
+    return pd.DataFrame(rows, columns=["블로그ID", "전화번호"])
 
 
 def save_best(ids: List[str]) -> None:
@@ -208,10 +253,11 @@ def save_best(ids: List[str]) -> None:
         f.writelines(sorted(list(merged)))
 
 
-def load_best() -> pd.DataFrame:
+def load_best(limit: int | None = None) -> pd.DataFrame:
+    limit = limit or MAX_FETCH
     if _use_firestore():
         client = _get_firestore()
-        docs = client.collection(COL_BEST).stream()
+        docs = client.collection(COL_BEST).limit(limit).stream()
         ids = [d.to_dict().get("blog_id") for d in docs if d.to_dict().get("blog_id")]
         if not ids:
             return pd.DataFrame(columns=["블로그ID"])
@@ -219,8 +265,13 @@ def load_best() -> pd.DataFrame:
 
     if not os.path.exists(STORE_BEST):
         return pd.DataFrame(columns=["블로그ID"])
+    ids: List[str] = []
     with open(STORE_BEST, "r", encoding="utf-8") as f:
-        ids = [i.strip() for i in f.readlines() if i.strip()]
+        for idx, line in enumerate(f):
+            if idx >= limit:
+                break
+            if line.strip():
+                ids.append(line.strip())
     return pd.DataFrame(ids, columns=["블로그ID"])
 
 
@@ -247,10 +298,11 @@ def save_match(df: pd.DataFrame) -> None:
     df.to_excel(MATCH_XLSX, index=False)
 
 
-def load_match() -> pd.DataFrame:
+def load_match(limit: int | None = None) -> pd.DataFrame:
+    limit = limit or MAX_FETCH
     if _use_firestore():
         client = _get_firestore()
-        docs = client.collection(COL_MATCH).stream()
+        docs = client.collection(COL_MATCH).limit(limit).stream()
         rows = []
         for d in docs:
             data = d.to_dict()
@@ -270,7 +322,8 @@ def load_match() -> pd.DataFrame:
 
     if not os.path.exists(MATCH_XLSX):
         return pd.DataFrame(columns=["블로그ID", "전화번호", "메모"])
-    df = pd.read_excel(MATCH_XLSX, dtype=str)
+    df = load_excel(MATCH_XLSX)
+    df = df.head(limit)
     if "메모" not in df.columns:
         df["메모"] = ""
     return df
@@ -321,7 +374,7 @@ if menu == "파일 업로드":
     uploaded = st.file_uploader("엑셀 파일 업로드", type=["xlsx", "xls"], key="excel_upload")
 
     if uploaded:
-        df = pd.read_excel(uploaded, header=None)
+        df = load_excel(uploaded)
         st.session_state["excel_df"] = df
         st.success("엑셀을 불러왔습니다 (세션 저장됨)")
         st.write(df.head())
@@ -382,25 +435,25 @@ elif menu == "누적 저장소":
 
     with col1:
         st.subheader("📦 카페 누적 DB")
-        df_cafe = load_cafe()
-        st.metric("누적 수량", len(df_cafe))
-        st.dataframe(df_cafe.head(30), use_container_width=True)
-        st.download_button(
-            "전체 TXT 다운로드",
-            "\n".join([f"{r['블로그ID']},{r['전화번호']}" for _, r in df_cafe.iterrows()]).encode("utf-8"),
-            "blog_store.txt",
-        )
+        if st.button("카페 데이터 불러오기", key="load_cafe_view"):
+            with st.spinner("불러오는 중..."):
+                df_cafe = load_cafe(limit=DEFAULT_VIEW_LIMIT)
+            st.caption(f"표시 최대 {DEFAULT_VIEW_LIMIT}행")
+            st.metric("표시 중", len(df_cafe))
+            st.dataframe(df_cafe, use_container_width=True, height=360)
+        else:
+            st.info("버튼을 눌러 조회하세요 (대용량 보호)")
 
     with col2:
         st.subheader("📚 최적리스트 DB")
-        df_best = load_best()
-        st.metric("최적리스트 수", len(df_best))
-        st.dataframe(df_best.head(30), use_container_width=True)
-        st.download_button(
-            "전체 TXT 다운로드",
-            "\n".join(df_best["블로그ID"].tolist()).encode("utf-8"),
-            "best_store.txt",
-        )
+        if st.button("최적리스트 불러오기", key="load_best_view"):
+            with st.spinner("불러오는 중..."):
+                df_best = load_best(limit=DEFAULT_VIEW_LIMIT)
+            st.caption(f"표시 최대 {DEFAULT_VIEW_LIMIT}행")
+            st.metric("표시 중", len(df_best))
+            st.dataframe(df_best, use_container_width=True, height=360)
+        else:
+            st.info("버튼을 눌러 조회하세요 (대용량 보호)")
 
 
 # ============================================================
@@ -409,18 +462,23 @@ elif menu == "누적 저장소":
 elif menu == "매칭 결과 & 메모":
     st.header("📞 매칭 결과 & 메모")
 
-    df = load_match()
-    if df.empty:
-        st.warning("매칭 데이터가 없습니다.")
-    else:
-        st.metric("매칭결과 수", len(df))
-        if "메모" not in df.columns:
-            df["메모"] = ""
-        edited = st.data_editor(df, use_container_width=True)
+    if st.button("매칭 데이터 불러오기", key="load_match_view"):
+        with st.spinner("불러오는 중..."):
+            df = load_match(limit=DEFAULT_VIEW_LIMIT)
+        st.caption(f"표시 최대 {DEFAULT_VIEW_LIMIT}행 (전체 편집 시 성능 보호)")
+        if df.empty:
+            st.warning("매칭 데이터가 없습니다.")
+        else:
+            st.metric("표시 중", len(df))
+            if "메모" not in df.columns:
+                df["메모"] = ""
+            edited = st.data_editor(df, use_container_width=True)
 
-        if st.button("저장"):
-            save_match(edited)
-            st.success("저장 완료")
+            if st.button("저장"):
+                save_match(edited)
+                st.success("저장 완료")
+    else:
+        st.info("버튼을 눌러 조회하세요 (대용량 보호)")
 
 
 # ============================================================
